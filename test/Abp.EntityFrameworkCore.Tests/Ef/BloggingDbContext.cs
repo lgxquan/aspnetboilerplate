@@ -18,6 +18,12 @@ public class BloggingDbContext : AbpDbContext
 
     public DbSet<SubBlogCategory> SubBlogCategories { get; set; }
 
+    public DbSet<Category> Categories { get; set; }
+
+    public DbSet<Product> Products { get; set; }
+
+    public DbSet<ProductTag> ProductTags { get; set; }
+
     public BloggingDbContext(DbContextOptions<BloggingDbContext> options)
         : base(options)
     {

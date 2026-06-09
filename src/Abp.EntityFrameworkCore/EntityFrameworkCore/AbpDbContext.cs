@@ -90,6 +90,8 @@ public abstract class AbpDbContext : DbContext, ITransientDependency, IShouldIni
 
     public virtual bool IsMustHaveTenantFilterEnabled => CurrentTenantId != null && CurrentUnitOfWorkProvider?.Current?.IsFilterEnabled(AbpDataFilters.MustHaveTenant) == true;
 
+    public virtual bool IsSoftDeleteCascadeEnabled => AbpEfCoreConfiguration?.EnableSoftDeleteCascade == true;
+
     private static MethodInfo ConfigureGlobalFiltersMethodInfo = typeof(AbpDbContext).GetMethod(nameof(ConfigureGlobalFilters), BindingFlags.Instance | BindingFlags.NonPublic);
 
     private static MethodInfo ConfigureGlobalValueConverterMethodInfo = typeof(AbpDbContext).GetMethod(nameof(ConfigureGlobalValueConverter), BindingFlags.Instance | BindingFlags.NonPublic);
@@ -309,6 +311,11 @@ public abstract class AbpDbContext : DbContext, ITransientDependency, IShouldIni
 
         var userId = GetAuditUserId();
 
+        if (IsSoftDeleteCascadeEnabled)
+        {
+            CascadeSoftDelete();
+        }
+
         foreach (var entry in ChangeTracker.Entries().ToList())
         {
             if (entry.State != EntityState.Modified && entry.CheckOwnedEntityChange())
@@ -519,6 +526,115 @@ public abstract class AbpDbContext : DbContext, ITransientDependency, IShouldIni
             userId,
             CurrentUnitOfWorkProvider?.Current?.AuditFieldConfiguration
         );
+    }
+
+    /// <summary>
+    /// Cascades soft-deletes to dependent (child) entities of every entity that is being soft-deleted
+    /// in this <see cref="SaveChanges()"/> call. Because ABP turns a soft-delete into an UPDATE
+    /// (see <see cref="CancelDeletionForSoftDelete"/>), EF Core never issues the parent DELETE and
+    /// therefore never triggers the database cascade. This method restores the expected cascade
+    /// semantics for soft-deletable entities: it walks each soft-deleted entity's cascade-configured
+    /// child navigations, loading children when necessary, and marks them as deleted so the normal
+    /// ABP delete pipeline soft-deletes (or hard-deletes) them too. The traversal is breadth-first and
+    /// guarded against cycles so grandchildren are cascaded as well.
+    /// </summary>
+    protected virtual void CascadeSoftDelete()
+    {
+        var queue = new Queue<EntityEntry>();
+        foreach (var entry in ChangeTracker.Entries().ToList())
+        {
+            if (entry.State == EntityState.Deleted &&
+                entry.Entity is ISoftDelete &&
+                !IsHardDeleteEntity(entry))
+            {
+                queue.Enqueue(entry);
+            }
+        }
+
+        var visited = new HashSet<object>();
+
+        while (queue.Count > 0)
+        {
+            var parentEntry = queue.Dequeue();
+            if (!visited.Add(parentEntry.Entity))
+            {
+                continue;
+            }
+
+            foreach (var childEntry in GetCascadeSoftDeleteChildren(parentEntry))
+            {
+                if (childEntry.State == EntityState.Deleted)
+                {
+                    continue;
+                }
+
+                // Already soft-deleted children don't need to be touched again.
+                if (childEntry.Entity is ISoftDelete childSoftDelete && childSoftDelete.IsDeleted)
+                {
+                    continue;
+                }
+
+                childEntry.State = EntityState.Deleted;
+
+                if (childEntry.Entity is ISoftDelete && !IsHardDeleteEntity(childEntry))
+                {
+                    queue.Enqueue(childEntry);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the tracked dependent entities of <paramref name="parentEntry"/> that should be removed
+    /// together with it, i.e. the children reached through principal-to-dependent navigations whose
+    /// foreign key is configured to cascade on delete. Children are loaded from the database when the
+    /// navigation has not been loaded yet.
+    /// </summary>
+    protected virtual IEnumerable<EntityEntry> GetCascadeSoftDeleteChildren(EntityEntry parentEntry)
+    {
+        var children = new List<EntityEntry>();
+
+        foreach (var navigationEntry in parentEntry.Navigations)
+        {
+            if (navigationEntry.Metadata is not INavigation navigation)
+            {
+                // Skip skip-navigations (many-to-many); join rows are handled by their own foreign keys.
+                continue;
+            }
+
+            // We only follow navigations from the principal side to the dependents we own.
+            if (navigation.IsOnDependent)
+            {
+                continue;
+            }
+
+            if (navigation.ForeignKey.DeleteBehavior != DeleteBehavior.Cascade &&
+                navigation.ForeignKey.DeleteBehavior != DeleteBehavior.ClientCascade)
+            {
+                continue;
+            }
+
+            if (!navigationEntry.IsLoaded)
+            {
+                navigationEntry.Load();
+            }
+
+            switch (navigationEntry)
+            {
+                case CollectionEntry collectionEntry when collectionEntry.CurrentValue != null:
+                    foreach (var child in collectionEntry.CurrentValue)
+                    {
+                        children.Add(Entry(child));
+                    }
+
+                    break;
+                case ReferenceEntry referenceEntry when referenceEntry.CurrentValue != null:
+                    children.Add(Entry(referenceEntry.CurrentValue));
+                    break;
+            }
+        }
+
+        return children;
     }
 
     protected virtual void CancelDeletionForSoftDelete(EntityEntry entry)
