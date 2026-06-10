@@ -8,10 +8,14 @@ public interface IAbpEfCoreConfiguration
     public bool UseAbpQueryCompiler { get; set; }
 
     /// <summary>
-    /// When enabled, soft-deleting an entity (<see cref="Abp.Domain.Entities.ISoftDelete"/>) also
-    /// cascades the deletion to its dependent (child) entities that are configured with a cascade
-    /// delete behavior. Soft-deletable children are soft-deleted, other children are hard-deleted.
-    /// Default: false (preserves the historical behavior where children are left untouched).
+    /// When enabled, soft-deleting an <see cref="Abp.Domain.Entities.ISoftDelete"/> entity also
+    /// cascades to its <see cref="DeleteBehavior.Cascade"/> / <see cref="DeleteBehavior.ClientCascade"/>
+    /// children: soft-delete children are soft-deleted, others are hard-deleted. Children are
+    /// discovered through the parent's collection / reference navigations, so declare both sides
+    /// of the relationship — a foreign key without a principal-side navigation will be missed.
+    /// Unloaded navigations are loaded synchronously even on the <c>SaveChangesAsync</c> path;
+    /// preload them with <c>Include</c> when blocking I/O is a concern. Default: <c>false</c>.
+    /// See <c>AbpDbContext.CascadeSoftDelete</c> for the exact walk and the known limitations.
     /// </summary>
     public bool EnableSoftDeleteCascade { get; set; }
 

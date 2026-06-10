@@ -529,27 +529,17 @@ public abstract class AbpDbContext : DbContext, ITransientDependency, IShouldIni
     }
 
     /// <summary>
-    /// Cascades soft-deletes to dependent (child) entities of every entity that is being soft-deleted
-    /// in this <see cref="SaveChanges()"/> call. Because ABP turns a soft-delete into an UPDATE
-    /// (see <see cref="CancelDeletionForSoftDelete"/>), EF Core never issues the parent DELETE and
-    /// therefore never triggers the database cascade. This method restores the expected cascade
-    /// semantics for soft-deletable entities: it walks each soft-deleted entity's cascade-configured
-    /// child navigations, loading children when necessary, and marks them as deleted so the normal
-    /// ABP delete pipeline soft-deletes (or hard-deletes) them too. The traversal is breadth-first and
-    /// guarded against cycles so grandchildren are cascaded as well.
+    /// BFS over every <see cref="ISoftDelete"/> Deleted entity in the change tracker, marking
+    /// cascade-configured children as Deleted so the main <see cref="ApplyAbpConcepts()"/> loop
+    /// can soft-delete (or hard-delete) them. Two corners are intentionally not rescued: an
+    /// <see cref="ISoftDelete"/> grandchild reachable only through a non-soft middle node, and
+    /// the children of a parent that goes through <c>IRepository.HardDelete</c>; in both cases
+    /// EF Core's own OnSaveChanges cascade reasserts itself and hard-deletes the descendants.
     /// </summary>
     protected virtual void CascadeSoftDelete()
     {
         var queue = new Queue<EntityEntry>();
-        foreach (var entry in ChangeTracker.Entries().ToList())
-        {
-            if (entry.State == EntityState.Deleted &&
-                entry.Entity is ISoftDelete &&
-                !IsHardDeleteEntity(entry))
-            {
-                queue.Enqueue(entry);
-            }
-        }
+        SeedCascadeSoftDeleteQueue(queue);
 
         var visited = new HashSet<object>();
 
@@ -563,20 +553,7 @@ public abstract class AbpDbContext : DbContext, ITransientDependency, IShouldIni
 
             foreach (var childEntry in GetCascadeSoftDeleteChildren(parentEntry))
             {
-                if (childEntry.State == EntityState.Deleted)
-                {
-                    continue;
-                }
-
-                // Already soft-deleted children don't need to be touched again.
-                if (childEntry.Entity is ISoftDelete childSoftDelete && childSoftDelete.IsDeleted)
-                {
-                    continue;
-                }
-
-                childEntry.State = EntityState.Deleted;
-
-                if (childEntry.Entity is ISoftDelete && !IsHardDeleteEntity(childEntry))
+                if (TrySetCascadeSoftDeleteChildAsDeleted(childEntry))
                 {
                     queue.Enqueue(childEntry);
                 }
@@ -585,10 +562,65 @@ public abstract class AbpDbContext : DbContext, ITransientDependency, IShouldIni
     }
 
     /// <summary>
-    /// Returns the tracked dependent entities of <paramref name="parentEntry"/> that should be removed
-    /// together with it, i.e. the children reached through principal-to-dependent navigations whose
-    /// foreign key is configured to cascade on delete. Children are loaded from the database when the
-    /// navigation has not been loaded yet.
+    /// Picks the entries that should feed <see cref="CascadeSoftDelete"/>'s BFS. Override to add
+    /// or skip seeds (e.g. extra entity types, custom hard-delete markers).
+    /// </summary>
+    protected virtual void SeedCascadeSoftDeleteQueue(Queue<EntityEntry> queue)
+    {
+        // Only ISoftDelete + non hard-delete parents need fixing up: they get rewritten to
+        // Modified, so EF Core would skip the cascade entirely. Other Deleted parents issue a
+        // real DELETE and EF Core handles their cascade itself.
+        foreach (var entry in ChangeTracker.Entries().ToList())
+        {
+            if (entry.State == EntityState.Deleted &&
+                entry.Entity is ISoftDelete &&
+                !IsHardDeleteEntity(entry))
+            {
+                queue.Enqueue(entry);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Decides how a cascade child is taken over by the soft-delete pipeline and whether the BFS
+    /// should keep walking through its own dependents. Returns <c>true</c> when the BFS should
+    /// enqueue the child for further descent.
+    /// </summary>
+    protected virtual bool TrySetCascadeSoftDeleteChildAsDeleted(EntityEntry childEntry)
+    {
+        // Mirror EF Core's StateManager.CascadeDelete: an Added dependent is detached when the
+        // principal is removed, so "added in this UoW, then orphaned by the cascade" disappears
+        // instead of being persisted.
+        if (childEntry.State == EntityState.Added)
+        {
+            childEntry.State = EntityState.Detached;
+            return false;
+        }
+
+        if (childEntry.State == EntityState.Deleted ||
+            childEntry.State == EntityState.Detached)
+        {
+            return false;
+        }
+
+        // Don't restamp DeletionTime / DeleterUserId on an already soft-deleted row.
+        if (childEntry.Entity is ISoftDelete childSoftDelete && childSoftDelete.IsDeleted)
+        {
+            return false;
+        }
+
+        childEntry.State = EntityState.Deleted;
+
+        // Only descend through soft-delete (non hard-delete) children: a non-soft child is about
+        // to be DELETE'd for real and EF Core's own OnSaveChanges cascade pass will overwrite any
+        // Modified state we set on its descendants anyway.
+        return childEntry.Entity is ISoftDelete && !IsHardDeleteEntity(childEntry);
+    }
+
+    /// <summary>
+    /// Returns the cascade children to walk for <paramref name="parentEntry"/>. Default walks
+    /// the parent's principal-side navigations and loads them on demand; override to plug in
+    /// a different lookup (e.g. foreign-key-based for entities with no navigation declared).
     /// </summary>
     protected virtual IEnumerable<EntityEntry> GetCascadeSoftDeleteChildren(EntityEntry parentEntry)
     {
@@ -596,20 +628,7 @@ public abstract class AbpDbContext : DbContext, ITransientDependency, IShouldIni
 
         foreach (var navigationEntry in parentEntry.Navigations)
         {
-            if (navigationEntry.Metadata is not INavigation navigation)
-            {
-                // Skip skip-navigations (many-to-many); join rows are handled by their own foreign keys.
-                continue;
-            }
-
-            // We only follow navigations from the principal side to the dependents we own.
-            if (navigation.IsOnDependent)
-            {
-                continue;
-            }
-
-            if (navigation.ForeignKey.DeleteBehavior != DeleteBehavior.Cascade &&
-                navigation.ForeignKey.DeleteBehavior != DeleteBehavior.ClientCascade)
+            if (!ShouldFollowCascadeSoftDeleteNavigation(navigationEntry))
             {
                 continue;
             }
@@ -619,22 +638,60 @@ public abstract class AbpDbContext : DbContext, ITransientDependency, IShouldIni
                 navigationEntry.Load();
             }
 
-            switch (navigationEntry)
-            {
-                case CollectionEntry collectionEntry when collectionEntry.CurrentValue != null:
-                    foreach (var child in collectionEntry.CurrentValue)
-                    {
-                        children.Add(Entry(child));
-                    }
-
-                    break;
-                case ReferenceEntry referenceEntry when referenceEntry.CurrentValue != null:
-                    children.Add(Entry(referenceEntry.CurrentValue));
-                    break;
-            }
+            CollectCascadeSoftDeleteChildren(navigationEntry, children);
         }
 
         return children;
+    }
+
+    /// <summary>
+    /// Filter for the navigations that <see cref="GetCascadeSoftDeleteChildren"/> follows.
+    /// Skips skip-navigations, owned navigations, dependent-side navigations and FKs whose
+    /// <see cref="DeleteBehavior"/> is neither <see cref="DeleteBehavior.Cascade"/> nor
+    /// <see cref="DeleteBehavior.ClientCascade"/>. Override to add custom filters.
+    /// </summary>
+    protected virtual bool ShouldFollowCascadeSoftDeleteNavigation(NavigationEntry navigationEntry)
+    {
+        // Skip skip-navigations (many-to-many): their join rows are handled by their own FKs.
+        if (navigationEntry.Metadata is not INavigation navigation)
+        {
+            return false;
+        }
+
+        if (navigation.TargetEntityType.IsOwned())
+        {
+            return false;
+        }
+
+        if (navigation.IsOnDependent)
+        {
+            return false;
+        }
+
+        return navigation.ForeignKey.DeleteBehavior == DeleteBehavior.Cascade ||
+               navigation.ForeignKey.DeleteBehavior == DeleteBehavior.ClientCascade;
+    }
+
+    /// <summary>
+    /// Pulls the tracked child entries out of a loaded <paramref name="navigationEntry"/> into
+    /// <paramref name="children"/>. Override to reshape what counts as a cascade child for a
+    /// given navigation.
+    /// </summary>
+    protected virtual void CollectCascadeSoftDeleteChildren(NavigationEntry navigationEntry, List<EntityEntry> children)
+    {
+        switch (navigationEntry)
+        {
+            case CollectionEntry collectionEntry when collectionEntry.CurrentValue != null:
+                foreach (var child in collectionEntry.CurrentValue)
+                {
+                    children.Add(Entry(child));
+                }
+
+                break;
+            case ReferenceEntry referenceEntry when referenceEntry.CurrentValue != null:
+                children.Add(Entry(referenceEntry.CurrentValue));
+                break;
+        }
     }
 
     protected virtual void CancelDeletionForSoftDelete(EntityEntry entry)
